@@ -5,6 +5,7 @@ package redact
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -347,16 +348,11 @@ func maskHeaderList(list []any) []any {
 }
 
 func maskHeaderString(key, s string) string {
-	var decoded any
-	dec := json.NewDecoder(strings.NewReader(s))
-	dec.UseNumber()
-	if err := dec.Decode(&decoded); err == nil {
-		switch t := decoded.(type) {
-		case map[string]any:
-			return encodeCompact(maskHeaderMap(t))
-		case []any:
-			return encodeCompact(maskHeaderList(t))
-		}
+	switch t := decodeContainer(s).(type) {
+	case map[string]any:
+		return encodeCompact(maskHeaderMap(t))
+	case []any:
+		return encodeCompact(maskHeaderList(t))
 	}
 	if !strings.Contains(s, ":") && !strings.Contains(s, "\n") && SensitiveHeader(key) {
 		return Mask
@@ -389,6 +385,9 @@ func maskHeaderEntry(el any) any {
 	if pair, ok := el.([]any); ok {
 		return maskHeaderPair(pair)
 	}
+	if str, ok := el.(string); ok {
+		return maskHeaderString("", str)
+	}
 	m, ok := el.(map[string]any)
 	if !ok {
 		return walk(el)
@@ -417,6 +416,25 @@ func maskHeaderEntry(el any) any {
 	return out
 }
 
+// decodeContainer returns the JSON object or array that s consists of entirely,
+// or nil if s is anything else.
+func decodeContainer(s string) any {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil
+	}
+	switch v.(type) {
+	case map[string]any, []any:
+		return v
+	}
+	return nil
+}
+
 func isHeaderNameField(n string) bool {
 	return n == "name" || n == "key" || n == "header"
 }
@@ -443,14 +461,18 @@ func encodeCompact(v any) string {
 }
 
 func wrapUntrusted(v any) any {
-	if v == nil {
-		return nil
-	}
 	var s string
-	if str, ok := v.(string); ok {
-		s = Text(str)
-	} else {
-		s = encodeCompact(walk(v))
+	switch t := v.(type) {
+	case string:
+		if c := decodeContainer(t); c != nil {
+			s = encodeCompact(walk(c))
+		} else {
+			s = Text(t)
+		}
+	case map[string]any, []any:
+		s = encodeCompact(walk(t))
+	default:
+		return v
 	}
 	u := Untrusted(s)
 	return map[string]any{

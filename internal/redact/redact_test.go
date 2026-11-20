@@ -683,3 +683,42 @@ func TestURLDeepNestingTerminates(t *testing.T) {
 		t.Fatal("Text leaked deeply nested credential")
 	}
 }
+
+func TestSanitizeUntrustedKeepsScalars(t *testing.T) {
+	in := map[string]any{"payload_size": 42, "has_payload": true, "body_bytes": 1.5, "payload": nil}
+	got := asMap(t, mustSanitize(t, in))
+	if got["payload_size"] != json.Number("42") || got["has_payload"] != true || got["body_bytes"] != json.Number("1.5") || got["payload"] != nil {
+		t.Fatalf("scalars wrapped or changed: %#v", got)
+	}
+}
+
+func TestSanitizeHeaderListStrings(t *testing.T) {
+	in := map[string]any{"headers": []any{"Authorization: Bearer R1", "Cookie: R2", "Accept: a/b"}}
+	got := asMap(t, mustSanitize(t, in))["headers"].([]any)
+	want := []any{"Authorization: " + Mask, "Cookie: " + Mask, "Accept: a/b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v", got)
+	}
+}
+
+func TestSanitizeJSONStringPayload(t *testing.T) {
+	in := map[string]any{
+		"payload":       `{"password":"R11","client_secret":"R12","ok":1}`,
+		"response_body": `[{"token":"R13","link":"https://u:R14@h/","n":2}]`,
+		"request_body":  `{"password":"R15"} trailing`,
+	}
+	got := asMap(t, mustSanitize(t, in))
+	if c := wrapped(t, got["payload"])["content"]; c != `{"ok":1}` {
+		t.Errorf("payload content: %v", c)
+	}
+	rb := wrapped(t, got["response_body"])["content"].(string)
+	if !strings.Contains(rb, `"n":2`) {
+		t.Errorf("array body: %v", rb)
+	}
+	out, _ := json.Marshal(got)
+	for _, leak := range []string{"R11", "R12", "R13", "R14"} {
+		if strings.Contains(string(out), leak) {
+			t.Errorf("leaked %s: %s", leak, out)
+		}
+	}
+}
