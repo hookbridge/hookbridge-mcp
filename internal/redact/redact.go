@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -278,8 +279,11 @@ func dropKey(n string) bool {
 }
 
 func untrustedKey(n string) bool {
+	if hasAnySuffix(n, "sha256", "sha1", "hash", "digest") {
+		return false
+	}
 	switch n {
-	case "clientname", "lasterror", "errortext", "errormessage":
+	case "clientname", "lasterror", "errortext", "errormessage", "description":
 		return true
 	}
 	return hasAnyPart(n, "body", "payload")
@@ -317,6 +321,8 @@ func walkField(key string, val any) (any, bool) {
 	switch {
 	case dropKey(n):
 		return nil, false
+	case n == "responseheaders":
+		return wrapResponseHeaders(key, val), true
 	case untrustedKey(n):
 		return wrapUntrusted(val), true
 	case headersKey(n):
@@ -460,6 +466,61 @@ func encodeCompact(v any) string {
 	return strings.TrimSuffix(buf.String(), "\n")
 }
 
+const (
+	maxHeaderValueBytes = 1024
+	maxHeaderCount      = 100
+)
+
+// wrapResponseHeaders masks first, then caps and wraps. The masked tree is not
+// walked again because that would drop keys like Authorization.
+func wrapResponseHeaders(key string, v any) any {
+	masked := walkHeaders(key, v)
+	var s string
+	switch t := masked.(type) {
+	case string:
+		s = t
+	case map[string]any:
+		s = encodeCompact(capHeaders(t))
+	default:
+		s = encodeCompact(t)
+	}
+	return untrustedMap(Untrusted(s))
+}
+
+func capHeaders(m map[string]any) map[string]any {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string]any, len(m))
+	for i, k := range keys {
+		if i == maxHeaderCount {
+			out["[omitted]"] = strconv.Itoa(len(keys)-maxHeaderCount) + " more headers"
+			break
+		}
+		val := m[k]
+		if str, ok := val.(string); ok && len(str) > maxHeaderValueBytes {
+			cut := maxHeaderValueBytes
+			for cut > 0 && !utf8.RuneStart(str[cut]) {
+				cut--
+			}
+			val = str[:cut] + "...[truncated]"
+		}
+		out[k] = val
+	}
+	return out
+}
+
+func untrustedMap(u UntrustedData) map[string]any {
+	return map[string]any{
+		"warning":        u.Warning,
+		"content":        u.Content,
+		"truncated":      u.Truncated,
+		"original_bytes": json.Number(strconv.Itoa(u.OriginalBytes)),
+	}
+}
+
 func wrapUntrusted(v any) any {
 	var s string
 	switch t := v.(type) {
@@ -474,11 +535,5 @@ func wrapUntrusted(v any) any {
 	default:
 		return v
 	}
-	u := Untrusted(s)
-	return map[string]any{
-		"warning":        u.Warning,
-		"content":        u.Content,
-		"truncated":      u.Truncated,
-		"original_bytes": json.Number(strconv.Itoa(u.OriginalBytes)),
-	}
+	return untrustedMap(Untrusted(s))
 }
