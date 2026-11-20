@@ -27,6 +27,13 @@ func tools() []toolDef {
 	return []toolDef{
 		{"list_projects", registerListProjects},
 		{"get_project_overview", registerProjectOverview},
+		{"list_endpoints", registerListEndpoints},
+		{"get_endpoint", registerGetEndpoint},
+		{"list_messages", registerListMessages},
+		{"get_message", registerGetMessage},
+		{"list_message_attempts", registerListMessageAttempts},
+		{"get_metrics", registerGetMetrics},
+		{"list_dlq_messages", registerListDLQMessages},
 	}
 }
 
