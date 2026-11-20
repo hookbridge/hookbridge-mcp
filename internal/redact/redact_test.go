@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -447,7 +448,7 @@ func TestSensitiveHeaderCookieContains(t *testing.T) {
 
 func TestSanitizeKeyNormalization(t *testing.T) {
 	dropped := []string{"auth_token", "bearer_token", "id_token", "apiKey", "accessToken", "refreshToken", "signingKey", "privateKey", "client_secret", "jwt", "bearer", "keys", "Api-Key", "user credentials", "passwd", "tokens"}
-	kept := []string{"api_key_id", "key_id", "signing_key_id", "apiKeyId", "api_key_prefix", "token_expires_at", "name", "secret_count", "token_type"}
+	kept := []string{"api_key_id", "key_id", "signing_key_id", "apiKeyId", "api_key_prefix", "token_expires_at", "name", "token_type", "sha_count"}
 	in := map[string]any{}
 	for _, k := range dropped {
 		in[k] = "v"
@@ -588,5 +589,97 @@ func TestSanitizeNoCredentialEverSurvives(t *testing.T) {
 		if strings.Contains(string(out), s) {
 			t.Errorf("secret %q leaked: %s", s, out)
 		}
+	}
+}
+
+func TestSanitizeAlwaysDropSecretWords(t *testing.T) {
+	dropped := []string{
+		"credentials", "secret_id", "client_secret_at", "password_type", "hmac_key", "encryption_key",
+		"secret_key", "access_key", "shared_key", "signing_key", "x_hmac", "authorization", "Cookie", "cookies",
+		"passwd_prefix", "private_key_id",
+	}
+	kept := []string{"api_key_id", "key_id", "signing_key_id", "apiKeyId", "api_key_prefix", "token_expires_at", "key_count"}
+	in := map[string]any{}
+	for _, k := range append(append([]string{}, dropped...), kept...) {
+		in[k] = "v"
+	}
+	got := asMap(t, mustSanitize(t, in))
+	for _, k := range dropped {
+		if _, ok := got[k]; ok {
+			t.Errorf("%q not dropped", k)
+		}
+	}
+	for _, k := range kept {
+		if _, ok := got[k]; !ok {
+			t.Errorf("%q wrongly dropped", k)
+		}
+	}
+}
+
+func TestSanitizeHeaderStrings(t *testing.T) {
+	in := map[string]any{
+		"request_headers":      "Authorization: Bearer C1\r\nCookie: C2=1\r\nAccept: text/html\r\nLocation: https://u:PW@h/",
+		"response_headers":     `[{"name":"Authorization","value":"C3"},["Set-Cookie","C4"],["Accept","a/b"]]`,
+		"authorization_header": "Bearer C5",
+		"content_type_header":  "text/html",
+		"extra_headers":        "single plain value",
+	}
+	got := asMap(t, mustSanitize(t, in))
+	if got["request_headers"] != "Authorization: [redacted]\nCookie: [redacted]\nAccept: text/html\nLocation: https://[redacted]@h/" {
+		t.Errorf("raw block: %q", got["request_headers"])
+	}
+	if got["response_headers"] != `[{"name":"Authorization","value":"[redacted]"},["Set-Cookie","[redacted]"],["Accept","a/b"]]` {
+		t.Errorf("json array string: %v", got["response_headers"])
+	}
+	if got["authorization_header"] != Mask {
+		t.Errorf("sensitive plain header: %v", got["authorization_header"])
+	}
+	if got["content_type_header"] != "text/html" || got["extra_headers"] != "single plain value" {
+		t.Errorf("benign plain headers changed: %v", got)
+	}
+}
+
+func TestSanitizeHeaderArrayShapes(t *testing.T) {
+	in := map[string]any{
+		"headers": []any{
+			map[string]any{"header": "Authorization", "value": "C1"},
+			[]any{"Cookie", "C2"},
+			[]any{"Accept", "a/b"},
+		},
+	}
+	arr := asMap(t, mustSanitize(t, in))["headers"].([]any)
+	if asMap(t, arr[0])["value"] != Mask || asMap(t, arr[0])["header"] != "Authorization" {
+		t.Errorf("header name field: %v", arr[0])
+	}
+	if !reflect.DeepEqual(arr[1], []any{"Cookie", Mask}) || !reflect.DeepEqual(arr[2], []any{"Accept", "a/b"}) {
+		t.Errorf("tuples: %v %v", arr[1], arr[2])
+	}
+}
+
+func TestURLNestedParamValues(t *testing.T) {
+	got := URL("https://h/?cb=https://u:D6@h2/&x=1")
+	if got != "https://h/?cb=https://[redacted]@h2/&x=1" {
+		t.Errorf("got %q", got)
+	}
+	got = URL("https://h/#next=https://h2/?token=D7")
+	if strings.Contains(got, "D7") {
+		t.Errorf("fragment nested leak: %q", got)
+	}
+}
+
+func TestURLDeepNestingTerminates(t *testing.T) {
+	deep := strings.Repeat("https://h/?a=", 1000) + "https://u:DEEPPW@h/"
+	done := make(chan string, 1)
+	go func() { done <- URL(deep) }()
+	select {
+	case got := <-done:
+		if strings.Contains(got, "DEEPPW") {
+			t.Fatal("deeply nested credential leaked")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("URL did not terminate quickly")
+	}
+	if strings.Contains(Text(deep), "DEEPPW") {
+		t.Fatal("Text leaked deeply nested credential")
 	}
 }

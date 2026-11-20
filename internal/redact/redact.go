@@ -62,14 +62,36 @@ func Headers(h map[string]string) map[string]string {
 	return out
 }
 
-// URL masks userinfo and sensitive query or fragment parameter values in raw.
-// It works on the string, not a parsed URL, so malformed input still fails closed.
+// maxNesting bounds how deep URLs nested in parameter values are scrubbed;
+// anything deeper that still looks like a URL is masked whole.
+const maxNesting = 8
+
+// URL masks userinfo and sensitive query or fragment parameter values in raw,
+// and scrubs URLs nested inside the remaining values. It works on the string,
+// not a parsed URL, so malformed input still fails closed. Known limits:
+// passwords containing an unescaped space, '/', '#' or '?' can leak.
 func URL(raw string) string {
-	return maskParams(maskUserinfo(raw))
+	return urlAt(raw, 0)
 }
 
-// Text masks every URL found inside free text.
+func urlAt(raw string, depth int) string {
+	return maskParams(maskUserinfo(raw), depth)
+}
+
+// Text masks every URL found inside free text. Known limits: schemeless
+// "user:pw@host" is not detected, and a URL ends at whitespace or one of
+// "'<>` so a password containing those can leak.
 func Text(s string) string {
+	return textAt(s, 0)
+}
+
+func textAt(s string, depth int) string {
+	if depth > maxNesting {
+		if strings.Contains(s, "://") {
+			return Mask
+		}
+		return s
+	}
 	var b strings.Builder
 	pos := 0
 	for {
@@ -87,7 +109,7 @@ func Text(s string) string {
 			end++
 		}
 		b.WriteString(s[pos:start])
-		b.WriteString(URL(s[start:end]))
+		b.WriteString(urlAt(s[start:end], depth))
 		pos = end
 	}
 	b.WriteString(s[pos:])
@@ -120,27 +142,27 @@ func maskUserinfo(raw string) string {
 	return raw[:start] + Mask + raw[lastAt:]
 }
 
-func maskParams(raw string) string {
+func maskParams(raw string, depth int) string {
 	rest, frag, hasFrag := strings.Cut(raw, "#")
 	pre, query, hasQuery := strings.Cut(rest, "?")
 	out := pre
 	if hasQuery {
-		out += "?" + maskParamList(query)
+		out += "?" + maskParamList(query, depth)
 	}
 	if hasFrag {
-		out += "#" + maskParamList(frag)
+		out += "#" + maskParamList(frag, depth)
 	}
 	return out
 }
 
-func maskParamList(s string) string {
+func maskParamList(s string, depth int) string {
 	var b strings.Builder
 	start := 0
 	for i := 0; i <= len(s); i++ {
 		if i < len(s) && s[i] != '&' && s[i] != ';' {
 			continue
 		}
-		b.WriteString(maskParam(s[start:i]))
+		b.WriteString(maskParam(s[start:i], depth))
 		if i < len(s) {
 			b.WriteByte(s[i])
 		}
@@ -149,12 +171,15 @@ func maskParamList(s string) string {
 	return b.String()
 }
 
-func maskParam(p string) string {
-	name, _, hasValue := strings.Cut(p, "=")
-	if hasValue && sensitiveParam(name) {
+func maskParam(p string, depth int) string {
+	name, value, hasValue := strings.Cut(p, "=")
+	if !hasValue {
+		return p
+	}
+	if sensitiveParam(name) {
 		return name + "=" + Mask
 	}
-	return p
+	return name + "=" + textAt(value, depth+1)
 }
 
 func sensitiveParam(name string) bool {
@@ -238,15 +263,17 @@ func hasAnyPart(s string, parts ...string) bool {
 }
 
 func dropKey(n string) bool {
+	if hasAnyPart(n, "secret", "password", "passwd", "privatekey", "credential", "hmac") {
+		return true
+	}
+	switch n {
+	case "authorization", "cookie", "cookies", "jwt", "bearer":
+		return true
+	}
 	if hasAnySuffix(n, "id", "ids", "prefix", "count", "at", "type", "expires", "expiry") {
 		return false
 	}
-	switch n {
-	case "key", "keys", "jwt", "bearer":
-		return true
-	}
-	return hasAnyPart(n, "secret", "password", "passwd", "privatekey", "signingkey", "apikey", "credential") ||
-		hasAnySuffix(n, "token", "tokens")
+	return hasAnySuffix(n, "key", "keys", "token", "tokens")
 }
 
 func untrustedKey(n string) bool {
@@ -292,35 +319,57 @@ func walkField(key string, val any) (any, bool) {
 	case untrustedKey(n):
 		return wrapUntrusted(val), true
 	case headersKey(n):
-		return walkHeaders(val), true
+		return walkHeaders(key, val), true
 	default:
 		return walk(val), true
 	}
 }
 
-func walkHeaders(v any) any {
+func walkHeaders(key string, v any) any {
 	switch t := v.(type) {
 	case map[string]any:
 		return maskHeaderMap(t)
 	case []any:
-		out := make([]any, len(t))
-		for i, el := range t {
-			out[i] = maskHeaderEntry(el)
-		}
-		return out
+		return maskHeaderList(t)
 	case string:
-		var decoded any
-		dec := json.NewDecoder(strings.NewReader(t))
-		dec.UseNumber()
-		if err := dec.Decode(&decoded); err == nil {
-			if m, ok := decoded.(map[string]any); ok {
-				return encodeCompact(maskHeaderMap(m))
-			}
-		}
-		return Text(t)
+		return maskHeaderString(key, t)
 	default:
 		return walk(v)
 	}
+}
+
+func maskHeaderList(list []any) []any {
+	out := make([]any, len(list))
+	for i, el := range list {
+		out[i] = maskHeaderEntry(el)
+	}
+	return out
+}
+
+func maskHeaderString(key, s string) string {
+	var decoded any
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	if err := dec.Decode(&decoded); err == nil {
+		switch t := decoded.(type) {
+		case map[string]any:
+			return encodeCompact(maskHeaderMap(t))
+		case []any:
+			return encodeCompact(maskHeaderList(t))
+		}
+	}
+	if !strings.Contains(s, ":") && !strings.Contains(s, "\n") && SensitiveHeader(key) {
+		return Mask
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		line = strings.TrimSuffix(line, "\r")
+		if name, _, ok := strings.Cut(line, ":"); ok && SensitiveHeader(name) {
+			line = name + ": " + Mask
+		}
+		lines[i] = line
+	}
+	return Text(strings.Join(lines, "\n"))
 }
 
 func maskHeaderMap(m map[string]any) map[string]any {
@@ -337,13 +386,16 @@ func maskHeaderMap(m map[string]any) map[string]any {
 
 // maskHeaderEntry handles {"name": ..., "value": ...} style header lists.
 func maskHeaderEntry(el any) any {
+	if pair, ok := el.([]any); ok {
+		return maskHeaderPair(pair)
+	}
 	m, ok := el.(map[string]any)
 	if !ok {
 		return walk(el)
 	}
 	sensitive := false
 	for k, val := range m {
-		if n := normalizeKey(k); n == "name" || n == "key" {
+		if n := normalizeKey(k); isHeaderNameField(n) {
 			if s, ok := val.(string); ok && SensitiveHeader(s) {
 				sensitive = true
 			}
@@ -352,7 +404,7 @@ func maskHeaderEntry(el any) any {
 	out := make(map[string]any, len(m))
 	for k, val := range m {
 		switch n := normalizeKey(k); {
-		case n == "name" || n == "key":
+		case isHeaderNameField(n):
 			out[k] = walk(val)
 		case (n == "value" || n == "values") && sensitive:
 			out[k] = Mask
@@ -363,6 +415,21 @@ func maskHeaderEntry(el any) any {
 		}
 	}
 	return out
+}
+
+func isHeaderNameField(n string) bool {
+	return n == "name" || n == "key" || n == "header"
+}
+
+func maskHeaderPair(pair []any) []any {
+	name, isString := "", false
+	if len(pair) == 2 {
+		name, isString = pair[0].(string)
+	}
+	if isString && SensitiveHeader(name) {
+		return []any{name, Mask}
+	}
+	return walk(pair).([]any)
 }
 
 func encodeCompact(v any) string {
