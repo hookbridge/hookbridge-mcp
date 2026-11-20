@@ -346,8 +346,8 @@ func TestSanitizeURLs(t *testing.T) {
 	if got["url"] != "https://h/p?token=[redacted]" || got["endpoint_url"] != "https://[redacted]@h/" || got["destinationUrl"] != "https://h/?sig=[redacted]" {
 		t.Fatalf("got %v", got)
 	}
-	if got["name"] != "https://h/?token=a" || got["urlish"] != "https://h/?token=a" {
-		t.Fatalf("non-url key changed: %v", got)
+	if got["name"] != "https://h/?token=[redacted]" || got["urlish"] != "https://h/?token=[redacted]" || got["url2"] != json.Number("5") {
+		t.Fatalf("free-text scrub missed: %v", got)
 	}
 }
 
@@ -400,5 +400,193 @@ func TestSanitizeTruncatesLargePayload(t *testing.T) {
 	p := wrapped(t, got["payload"])
 	if p["truncated"] != true {
 		t.Fatalf("not truncated: %v", p["truncated"])
+	}
+}
+
+func TestText(t *testing.T) {
+	tests := []struct{ name, in, want string }{
+		{"plain", "no url here", "no url here"},
+		{"error text", "POST https://u:PPP@h/?token=QQQ failed", "POST https://[redacted]@h/?token=[redacted] failed"},
+		{"json quote ends token", `{"u":"https://h/p?key=K","n":1}`, `{"u":"https://h/p?key=[redacted]","n":1}`},
+		{"two urls", "a http://x:y@h b ftp://h/?sig=1 c", "a http://[redacted]@h b ftp://h/?sig=[redacted] c"},
+		{"backtick", "see `https://h/?token=a` ok", "see `https://h/?token=[redacted]` ok"},
+		{"bare separator", "x ://y z", "x ://y z"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Text(tt.in); got != tt.want {
+				t.Fatalf("Text(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestURLFragmentAndSemicolon(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"https://h/cb#access_token=KKK", "https://h/cb#access_token=[redacted]"},
+		{"https://h/cb?a=1#id_token=KKK&state=s", "https://h/cb?a=1#id_token=[redacted]&state=s"},
+		{"https://h/p?a=1;token=KKK;b=2", "https://h/p?a=1;token=[redacted];b=2"},
+		{"https://h/p?jwt=a&bearer=b&sid=c&session=d&SessionId=e", "https://h/p?jwt=[redacted]&bearer=[redacted]&sid=[redacted]&session=[redacted]&SessionId=[redacted]"},
+		{"https://h/p#section-2", "https://h/p#section-2"},
+	}
+	for _, tt := range tests {
+		if got := URL(tt.in); got != tt.want {
+			t.Errorf("URL(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestSensitiveHeaderCookieContains(t *testing.T) {
+	for _, n := range []string{"Cookie2", "X-Cookie", "x-cookies"} {
+		if !SensitiveHeader(n) {
+			t.Errorf("%q should be sensitive", n)
+		}
+	}
+}
+
+func TestSanitizeKeyNormalization(t *testing.T) {
+	dropped := []string{"auth_token", "bearer_token", "id_token", "apiKey", "accessToken", "refreshToken", "signingKey", "privateKey", "client_secret", "jwt", "bearer", "keys", "Api-Key", "user credentials", "passwd", "tokens"}
+	kept := []string{"api_key_id", "key_id", "signing_key_id", "apiKeyId", "api_key_prefix", "token_expires_at", "name", "secret_count", "token_type"}
+	in := map[string]any{}
+	for _, k := range dropped {
+		in[k] = "v"
+	}
+	for _, k := range kept {
+		in[k] = "v"
+	}
+	got := asMap(t, mustSanitize(t, in))
+	for _, k := range dropped {
+		if _, ok := got[k]; ok {
+			t.Errorf("%q not dropped", k)
+		}
+	}
+	for _, k := range kept {
+		if _, ok := got[k]; !ok {
+			t.Errorf("%q wrongly dropped", k)
+		}
+	}
+}
+
+func TestSanitizeUntrustedKeyDetection(t *testing.T) {
+	in := map[string]any{}
+	keys := []string{"body_preview", "payload_preview", "body_snippet", "ClientName", "lastError", "errorText", "error_message", "ResponseBody", "response-body"}
+	for _, k := range keys {
+		in[k] = "x"
+	}
+	got := asMap(t, mustSanitize(t, in))
+	for _, k := range keys {
+		wrapped(t, got[k])
+	}
+}
+
+func TestSanitizeFreeTextScrubbing(t *testing.T) {
+	in := map[string]any{
+		"last_error": "POST https://u:PPP@h/?token=QQQ failed",
+		"endpoint":   "https://u:PPP@h/x",
+		"urls":       []string{"https://h/?key=QQQ", "plain"},
+		"uri":        "https://h/?sig=QQQ",
+		"callback":   "https://h/cb#access_token=QQQ",
+		"headers":    map[string]any{"Location": "https://u:PPP@h/x", "Accept": "text/html"},
+	}
+	out, err := json.Marshal(mustSanitize(t, in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"PPP", "QQQ"} {
+		if strings.Contains(string(out), leak) {
+			t.Errorf("leaked %s: %s", leak, out)
+		}
+	}
+	got := asMap(t, mustSanitize(t, in))
+	if got["urls"].([]any)[1] != "plain" || asMap(t, got["headers"])["Accept"] != "text/html" {
+		t.Fatalf("non-secrets changed: %v", got)
+	}
+}
+
+func TestSanitizePayloadIsScrubbed(t *testing.T) {
+	in := map[string]any{
+		"payload": map[string]any{
+			"user":    map[string]any{"password": "PPP", "name": "n"},
+			"headers": map[string]any{"Authorization": "QQQ"},
+			"link":    "https://u:RRR@h/?token=SSS",
+			"list":    []any{map[string]any{"client_secret": "TTT"}},
+		},
+		"request_body": "call https://u:PPP@h/?token=QQQ now",
+	}
+	out, _ := json.Marshal(mustSanitize(t, in))
+	for _, leak := range []string{"PPP", "QQQ", "RRR", "SSS", "TTT"} {
+		if strings.Contains(string(out), leak) {
+			t.Errorf("leaked %s: %s", leak, out)
+		}
+	}
+	if !strings.Contains(string(out), `"name":\"n\"`) && !strings.Contains(string(out), `\"name\":\"n\"`) {
+		t.Errorf("non-secret payload data lost: %s", out)
+	}
+}
+
+func TestSanitizeScrubsBeforeTruncating(t *testing.T) {
+	long := "https://" + strings.Repeat("a", MaxBodyBytes) + "@h/x"
+	got := asMap(t, mustSanitize(t, map[string]any{"payload": long}))
+	p := wrapped(t, got["payload"])
+	if p["truncated"] != false || p["content"] != "https://[redacted]@h/x" {
+		t.Fatalf("got %v", p)
+	}
+}
+
+func TestSanitizeHeaderShapes(t *testing.T) {
+	in := map[string]any{
+		"header": map[string]any{"Cookie": "c"},
+		"ResponseHeaders": []any{
+			map[string]any{"name": "Authorization", "value": "QQQ"},
+			map[string]any{"Name": "Set-Cookie", "values": []string{"QQQ", "QQQ2"}},
+			map[string]any{"key": "Content-Type", "value": "text/plain"},
+			map[string]any{"name": "Location", "value": "https://u:PPP@h/"},
+		},
+		"request_headers": `{"Authorization":"QQQ","Accept":"a/b"}`,
+		"other_headers":   "Location: https://u:PPP@h/ plain text",
+	}
+	got := asMap(t, mustSanitize(t, in))
+	if asMap(t, got["header"])["Cookie"] != Mask {
+		t.Errorf("header: %v", got["header"])
+	}
+	arr := got["ResponseHeaders"].([]any)
+	if asMap(t, arr[0])["value"] != Mask || asMap(t, arr[0])["name"] != "Authorization" {
+		t.Errorf("arr0: %v", arr[0])
+	}
+	if asMap(t, arr[1])["values"] != Mask {
+		t.Errorf("arr1: %v", arr[1])
+	}
+	if asMap(t, arr[2])["value"] != "text/plain" || asMap(t, arr[2])["key"] != "Content-Type" {
+		t.Errorf("arr2: %v", arr[2])
+	}
+	if asMap(t, arr[3])["value"] != "https://[redacted]@h/" {
+		t.Errorf("arr3: %v", arr[3])
+	}
+	if got["request_headers"] != `{"Accept":"a/b","Authorization":"[redacted]"}` {
+		t.Errorf("json string headers: %v", got["request_headers"])
+	}
+	if got["other_headers"] != "Location: https://[redacted]@h/ plain text" {
+		t.Errorf("text headers: %v", got["other_headers"])
+	}
+}
+
+func TestSanitizeNoCredentialEverSurvives(t *testing.T) {
+	secrets := []string{"hunter2", "pa://ss", "p@ss", "p:ss", "p%40ss", "s3cr3t://token", "tok/en:9000"}
+	for _, s := range secrets {
+		in := map[string]any{
+			"url":        "https://u:" + s + "@h/x",
+			"endpoint":   "https://h/x?api_key=" + s,
+			"headers":    map[string]any{"Location": "https://u:" + s + "@h", "Authorization": "Bearer " + s},
+			"last_error": "POST https://u:" + s + "@h/?token=" + s + " failed",
+			"payload":    map[string]any{"nested": map[string]any{"auth_token": s, "callback": "https://h/?sig=" + s}},
+		}
+		out, err := json.Marshal(mustSanitize(t, in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(out), s) {
+			t.Errorf("secret %q leaked: %s", s, out)
+		}
 	}
 }

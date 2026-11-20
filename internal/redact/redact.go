@@ -29,16 +29,13 @@ type UntrustedData struct {
 
 var sensitiveHeaderParts = []string{
 	"auth", "signature", "secret", "token", "password", "hmac",
-	"credential", "session", "api-key", "api_key", "apikey",
+	"credential", "session", "api-key", "api_key", "apikey", "cookie",
 }
 
 // SensitiveHeader reports whether a header name must be masked.
 // It over-masks on purpose.
 func SensitiveHeader(name string) bool {
 	n := strings.ToLower(strings.TrimSpace(name))
-	if n == "cookie" || n == "set-cookie" {
-		return true
-	}
 	for _, p := range sensitiveHeaderParts {
 		if strings.Contains(n, p) {
 			return true
@@ -47,7 +44,8 @@ func SensitiveHeader(name string) bool {
 	return false
 }
 
-// Headers returns a copy of h with sensitive values masked.
+// Headers returns a copy of h with sensitive values masked and URLs in the
+// remaining values scrubbed.
 func Headers(h map[string]string) map[string]string {
 	if h == nil {
 		return nil
@@ -56,16 +54,52 @@ func Headers(h map[string]string) map[string]string {
 	for k, v := range h {
 		if SensitiveHeader(k) {
 			v = Mask
+		} else {
+			v = Text(v)
 		}
 		out[k] = v
 	}
 	return out
 }
 
-// URL masks userinfo and sensitive query parameter values in raw.
+// URL masks userinfo and sensitive query or fragment parameter values in raw.
 // It works on the string, not a parsed URL, so malformed input still fails closed.
 func URL(raw string) string {
-	return maskQuery(maskUserinfo(raw))
+	return maskParams(maskUserinfo(raw))
+}
+
+// Text masks every URL found inside free text.
+func Text(s string) string {
+	var b strings.Builder
+	pos := 0
+	for {
+		i := strings.Index(s[pos:], "://")
+		if i < 0 {
+			break
+		}
+		i += pos
+		start := i
+		for start > pos && isSchemeChar(s[start-1]) {
+			start--
+		}
+		end := i + len("://")
+		for end < len(s) && !isURLTerminator(s[end]) {
+			end++
+		}
+		b.WriteString(s[pos:start])
+		b.WriteString(URL(s[start:end]))
+		pos = end
+	}
+	b.WriteString(s[pos:])
+	return b.String()
+}
+
+func isURLTerminator(c byte) bool {
+	return strings.IndexByte(" \t\r\n\f\v\"'<>`", c) >= 0
+}
+
+func isSchemeChar(c byte) bool {
+	return isASCIILetter(c) || (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
 }
 
 func maskUserinfo(raw string) string {
@@ -86,23 +120,41 @@ func maskUserinfo(raw string) string {
 	return raw[:start] + Mask + raw[lastAt:]
 }
 
-func maskQuery(raw string) string {
-	q := strings.Index(raw, "?")
-	if q == -1 {
-		return raw
+func maskParams(raw string) string {
+	rest, frag, hasFrag := strings.Cut(raw, "#")
+	pre, query, hasQuery := strings.Cut(rest, "?")
+	out := pre
+	if hasQuery {
+		out += "?" + maskParamList(query)
 	}
-	end := len(raw)
-	if h := strings.Index(raw[q:], "#"); h >= 0 {
-		end = q + h
+	if hasFrag {
+		out += "#" + maskParamList(frag)
 	}
-	parts := strings.Split(raw[q+1:end], "&")
-	for i, p := range parts {
-		name, _, hasValue := strings.Cut(p, "=")
-		if hasValue && sensitiveParam(name) {
-			parts[i] = name + "=" + Mask
+	return out
+}
+
+func maskParamList(s string) string {
+	var b strings.Builder
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i < len(s) && s[i] != '&' && s[i] != ';' {
+			continue
 		}
+		b.WriteString(maskParam(s[start:i]))
+		if i < len(s) {
+			b.WriteByte(s[i])
+		}
+		start = i + 1
 	}
-	return raw[:q+1] + strings.Join(parts, "&") + raw[end:]
+	return b.String()
+}
+
+func maskParam(p string) string {
+	name, _, hasValue := strings.Cut(p, "=")
+	if hasValue && sensitiveParam(name) {
+		return name + "=" + Mask
+	}
+	return p
 }
 
 func sensitiveParam(name string) bool {
@@ -110,7 +162,7 @@ func sensitiveParam(name string) bool {
 		name = decoded
 	}
 	switch strings.ToLower(name) {
-	case "key", "sig", "code", "pass", "pwd":
+	case "key", "sig", "code", "pass", "pwd", "jwt", "bearer", "sid":
 		return true
 	}
 	return SensitiveHeader(name)
@@ -121,8 +173,7 @@ func isValidScheme(s string) bool {
 		return false
 	}
 	for i := 1; i < len(s); i++ {
-		c := s[i]
-		if !isASCIILetter(c) && (c < '0' || c > '9') && c != '+' && c != '-' && c != '.' {
+		if !isSchemeChar(s[i]) {
 			return false
 		}
 	}
@@ -163,20 +214,51 @@ func Sanitize(v any) (any, error) {
 	return walk(tree), nil
 }
 
-var (
-	droppedKeys = map[string]bool{
-		"signing_key": true, "signing_keys": true, "token": true, "access_token": true,
-		"refresh_token": true, "api_key": true, "key": true,
-	}
-	untrustedKeys = map[string]bool{
-		"payload": true, "body": true, "request_body": true, "response_body": true,
-		"client_name": true, "last_error": true, "error_text": true, "error_message": true,
-	}
-)
+func normalizeKey(k string) string {
+	k = strings.ToLower(k)
+	return strings.NewReplacer("_", "", "-", "", " ", "").Replace(k)
+}
 
-func dropKey(k string) bool {
-	return droppedKeys[k] || strings.Contains(k, "secret") ||
-		strings.Contains(k, "password") || strings.Contains(k, "private_key")
+func hasAnySuffix(s string, suffixes ...string) bool {
+	for _, x := range suffixes {
+		if strings.HasSuffix(s, x) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyPart(s string, parts ...string) bool {
+	for _, x := range parts {
+		if strings.Contains(s, x) {
+			return true
+		}
+	}
+	return false
+}
+
+func dropKey(n string) bool {
+	if hasAnySuffix(n, "id", "ids", "prefix", "count", "at", "type", "expires", "expiry") {
+		return false
+	}
+	switch n {
+	case "key", "keys", "jwt", "bearer":
+		return true
+	}
+	return hasAnyPart(n, "secret", "password", "passwd", "privatekey", "signingkey", "apikey", "credential") ||
+		hasAnySuffix(n, "token", "tokens")
+}
+
+func untrustedKey(n string) bool {
+	switch n {
+	case "clientname", "lasterror", "errortext", "errormessage":
+		return true
+	}
+	return hasAnyPart(n, "body", "payload")
+}
+
+func headersKey(n string) bool {
+	return hasAnySuffix(n, "header", "headers")
 }
 
 func walk(v any) any {
@@ -184,21 +266,8 @@ func walk(v any) any {
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for k, val := range t {
-			lk := strings.ToLower(k)
-			switch {
-			case dropKey(lk):
-			case untrustedKeys[lk] || strings.HasSuffix(lk, "_body"):
-				out[k] = wrapUntrusted(val)
-			case lk == "headers" || strings.HasSuffix(lk, "_headers"):
-				out[k] = walkHeaders(val)
-			case lk == "url" || strings.HasSuffix(lk, "url"):
-				if s, ok := val.(string); ok {
-					out[k] = URL(s)
-				} else {
-					out[k] = walk(val)
-				}
-			default:
-				out[k] = walk(val)
+			if kept, ok := walkField(k, val); ok {
+				out[k] = kept
 			}
 		}
 		return out
@@ -208,16 +277,53 @@ func walk(v any) any {
 			out[i] = walk(val)
 		}
 		return out
+	case string:
+		return Text(t)
 	default:
 		return v
 	}
 }
 
+func walkField(key string, val any) (any, bool) {
+	n := normalizeKey(key)
+	switch {
+	case dropKey(n):
+		return nil, false
+	case untrustedKey(n):
+		return wrapUntrusted(val), true
+	case headersKey(n):
+		return walkHeaders(val), true
+	default:
+		return walk(val), true
+	}
+}
+
 func walkHeaders(v any) any {
-	m, ok := v.(map[string]any)
-	if !ok {
+	switch t := v.(type) {
+	case map[string]any:
+		return maskHeaderMap(t)
+	case []any:
+		out := make([]any, len(t))
+		for i, el := range t {
+			out[i] = maskHeaderEntry(el)
+		}
+		return out
+	case string:
+		var decoded any
+		dec := json.NewDecoder(strings.NewReader(t))
+		dec.UseNumber()
+		if err := dec.Decode(&decoded); err == nil {
+			if m, ok := decoded.(map[string]any); ok {
+				return encodeCompact(maskHeaderMap(m))
+			}
+		}
+		return Text(t)
+	default:
 		return walk(v)
 	}
+}
+
+func maskHeaderMap(m map[string]any) map[string]any {
 	out := make(map[string]any, len(m))
 	for k, val := range m {
 		if SensitiveHeader(k) {
@@ -229,20 +335,55 @@ func walkHeaders(v any) any {
 	return out
 }
 
+// maskHeaderEntry handles {"name": ..., "value": ...} style header lists.
+func maskHeaderEntry(el any) any {
+	m, ok := el.(map[string]any)
+	if !ok {
+		return walk(el)
+	}
+	sensitive := false
+	for k, val := range m {
+		if n := normalizeKey(k); n == "name" || n == "key" {
+			if s, ok := val.(string); ok && SensitiveHeader(s) {
+				sensitive = true
+			}
+		}
+	}
+	out := make(map[string]any, len(m))
+	for k, val := range m {
+		switch n := normalizeKey(k); {
+		case n == "name" || n == "key":
+			out[k] = walk(val)
+		case (n == "value" || n == "values") && sensitive:
+			out[k] = Mask
+		default:
+			if kept, ok := walkField(k, val); ok {
+				out[k] = kept
+			}
+		}
+	}
+	return out
+}
+
+func encodeCompact(v any) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "[unrepresentable]"
+	}
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
 func wrapUntrusted(v any) any {
 	if v == nil {
 		return nil
 	}
-	s, ok := v.(string)
-	if !ok {
-		var buf bytes.Buffer
-		enc := json.NewEncoder(&buf)
-		enc.SetEscapeHTML(false)
-		if err := enc.Encode(v); err != nil {
-			s = "[unrepresentable]"
-		} else {
-			s = strings.TrimSuffix(buf.String(), "\n")
-		}
+	var s string
+	if str, ok := v.(string); ok {
+		s = Text(str)
+	} else {
+		s = encodeCompact(walk(v))
 	}
 	u := Untrusted(s)
 	return map[string]any{
